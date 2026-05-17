@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import mammoth from 'mammoth'
 import * as XLSX from 'xlsx'
-import Fuse from 'fuse.js'
+import OpenAI from 'openai'
 
-export const runtime = 'nodejs'
-export const dynamic = 'force-dynamic'
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+})
 
 export async function POST(req: NextRequest) {
   try {
@@ -12,59 +13,39 @@ export async function POST(req: NextRequest) {
     const cctpFile = formData.get('cctp') as File
     const dpgfFile = formData.get('dpgf') as File
 
-    if (!cctpFile ||!dpgfFile) {
-      return NextResponse.json({ error: 'Fichiers manquants' }, { status: 400 })
-    }
-
-    // 1. Lire CCTP
+    // Parse CCTP.docx
     const cctpBuffer = Buffer.from(await cctpFile.arrayBuffer())
     const { value: cctpText } = await mammoth.extractRawText({ buffer: cctpBuffer })
-
-    // 2. Extraire lignes CCTP avec n° de lot/article
-    const cctpLines = cctpText
-     .split('\n')
-     .map(l => l.trim())
-     .filter(l => l.length > 10 && /^\d/.test(l))
-
-    // 3. Lire DPGF Excel
+    
+    // Parse DPGF.xlsx
     const dpgfBuffer = Buffer.from(await dpgfFile.arrayBuffer())
-    const workbook = XLSX.read(dpgfBuffer, { type: 'buffer' })
-    const sheetName = workbook.SheetNames[0]
-    const worksheet = workbook.Sheets[sheetName]
-    const dpgfData: any[] = XLSX.utils.sheet_to_json(worksheet, { header: 1 })
+    const workbook = XLSX.read(dpgfBuffer)
+    const dpgfData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]])
 
-    // 4. Fuzzy matching
-    const fuse = new Fuse(cctpLines, { threshold: 0.4, ignoreLocation: true })
+    // Match + recherche prix
+    const results = []
+    for (const lot of dpgfData as any[]) {
+      const designation = lot['Désignation'] || lot['Designation'] || lot['description']
+      
+      if (!designation) continue
 
-    const matchedData = dpgfData.map((row: any[]) => {
-      if (!row[0] || row.length === 0) return row
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini", // moins cher que gpt-4o
+        messages: [{
+          role: "user", 
+          content: `Prix moyen HT en France 2024 pour : ${designation}. Réponds uniquement avec le prix format: 450€/m²`
+        }]
+      })
+      
+      results.push({
+        lot: lot['Lot'] || lot['lot'],
+        designation: designation,
+        prixEstime: completion.choices[0].message.content
+      })
+    }
 
-      const libelle = String(row[1] || row[0] || '')
-      if (libelle.length < 5) return [...row, '']
-
-      const result = fuse.search(libelle)
-      const match = result[0]?.item || ''
-
-      return [...row, match]
-    })
-
-    // 5. Ajouter en-tête colonne Match
-    if (matchedData[0]) matchedData[0][matchedData[0].length - 1] = 'Match CCTP'
-
-    // 6. Générer Excel
-    const newSheet = XLSX.utils.aoa_to_sheet(matchedData)
-    const newWb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(newWb, newSheet, sheetName)
-    const outBuffer = XLSX.write(newWb, { type: 'buffer', bookType: 'xlsx' })
-
-    return new NextResponse(outBuffer, {
-      headers: {
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': 'attachment; filename="DPGF_matche.xlsx"'
-      }
-    })
-
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message }, { status: 500 })
+    return NextResponse.json({ matches: results })
+  } catch (error) {
+    return NextResponse.json({ error: 'Erreur serveur' }, { status: 500 })
   }
 }
