@@ -14,35 +14,38 @@ export async function POST(req: NextRequest) {
     const dpgfBuffer = Buffer.from(await dpgfFile.arrayBuffer());
     const workbook = XLSX.read(dpgfBuffer);
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const dpgfData = XLSX.utils.sheet_to_json(sheet);
 
-    console.log('Colonnes Excel:', Object.keys(dpgfData[0] || {}));
-    console.log('Nb lignes Excel:', dpgfData.length);
+    // On démarre à la ligne 5 : là où y'a PRESTATIONS, UNITES, etc
+    const dpgfData = XLSX.utils.sheet_to_json(sheet, { range: 5, defval: '' });
 
-    // On prend la 2ème colonne par défaut si on trouve pas "Désignation"
-    const keys = Object.keys(dpgfData[0] || {});
-    const designationKey = keys.find(k =>
-      k.toLowerCase().includes('design') ||
-      k.toLowerCase().includes('libell') ||
-      k.toLowerCase().includes('descript')
-    ) || keys[1]; // fallback: 2ème colonne
-
-    console.log('Colonne utilisée:', designationKey);
+    console.log('Nb lignes lues:', dpgfData.length);
+    console.log('Exemple ligne:', dpgfData[0]);
 
     const designations = (dpgfData as any[])
-     .map(lot => String(lot[designationKey] || '').trim())
-     .filter(Boolean)
-     .slice(0, 5);
+    .map(row => {
+       const prestation = String(row['PRESTATIONS'] || '').trim();
+       const unit = String(row['UNITES'] || '').trim();
+       return { prestation, unit };
+     })
+    .filter(r =>
+       r.prestation &&
+      !r.prestation.toUpperCase().includes('CHAPITRE') &&
+      !r.prestation.toUpperCase().includes('TOTAL') &&
+       r.prestation!== '#REF!'
+     )
+    .slice(0, 10); // Max 10 pour test
 
-    console.log('Designations extraites:', designations);
+    console.log('Designations extraites:', designations.map(d => d.prestation));
 
     if (designations.length === 0) {
-      return NextResponse.json({ error: 'Aucune désignation trouvée dans le DPGF' }, { status: 400 });
+      return NextResponse.json({ error: 'Aucune prestation trouvée. Vérifie le DPGF.' }, { status: 400 });
     }
 
     if (!process.env.GROQ_API_KEY) {
       return NextResponse.json({ error: 'Clé API Groq manquante' }, { status: 500 });
     }
+
+    const promptList = designations.map(d => `${d.prestation} (${d.unit})`);
 
     console.log('Call Groq...');
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -56,15 +59,15 @@ export async function POST(req: NextRequest) {
         messages: [
           {
             role: 'system',
-            content: 'Tu es économiste BTP France. Réponds UNIQUEMENT en JSON: {"resultats":[{"prix":"450€/m²"}]}. Aucun texte. Prix HT moyens France pour chaque lot.',
+            content: 'Tu es économiste BTP France. Réponds UNIQUEMENT en JSON: {"resultats":[{"prix":"450€/Ft"}]}. Prix HT moyens France. Garde l\'unité donnée.',
           },
           {
             role: 'user',
-            content: JSON.stringify(designations),
+            content: `Donne le prix HT pour: ${JSON.stringify(promptList)}`,
           },
         ],
         temperature: 0.1,
-        max_tokens: 500,
+        max_tokens: 800,
       }),
     });
 
@@ -91,13 +94,17 @@ export async function POST(req: NextRequest) {
     const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
     let y = 800;
 
-    page.drawText('DPGF Chiffre - LightAO', { x: 50, y, size: 18, font: fontBold });
-    y -= 40;
+    page.drawText('DPGF Chiffre - Lot 2 EP/SL', { x: 50, y, size: 16, font: fontBold });
+    y -= 30;
+    page.drawText('Prestation | Unité | Prix HT estimé', { x: 50, y, size: 12, font: fontBold });
+    y -= 20;
 
     designations.forEach((d, i) => {
-      const prix = prixData.resultats?.[i]?.prix || 'Non estime';
-      page.drawText(`${d.slice(0, 60)} : ${prix}`, { x: 50, y, size: 11, font });
-      y -= 20;
+      const prix = prixData.resultats?.[i]?.prix || 'Non estimé';
+      const line = `${d.prestation.slice(0, 40)} | ${d.unit} | ${prix}`;
+      page.drawText(line, { x: 50, y, size: 10, font });
+      y -= 15;
+      if (y < 50) return; // Évite de sortir de la page
     });
 
     const pdfBytes = await pdfDoc.save();
