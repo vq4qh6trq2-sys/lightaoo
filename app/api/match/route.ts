@@ -1,98 +1,80 @@
 import { NextRequest, NextResponse } from 'next/server';
-import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 
+export const maxDuration = 60; // On passe à 60s au lieu de 10s
+
 export async function POST(req: NextRequest) {
+  console.log('START');
   try {
     const formData = await req.formData();
-    const cctpFile = formData.get('cctp') as File;
     const dpgfFile = formData.get('dpgf') as File;
-
-    if (!cctpFile ||!dpgfFile) {
-      return NextResponse.json({ error: 'Fichiers manquants' }, { status: 400 });
-    }
-
-    const cctpBuffer = Buffer.from(await cctpFile.arrayBuffer());
-    await mammoth.extractRawText({ buffer: cctpBuffer });
+    if (!dpgfFile) return NextResponse.json({ error: 'DPGF manquant' }, { status: 400 });
 
     const dpgfBuffer = Buffer.from(await dpgfFile.arrayBuffer());
     const workbook = XLSX.read(dpgfBuffer);
     const dpgfData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
+    console.log('Excel lu:', dpgfData.length, 'lignes');
 
-    const results = [];
-    for (const lot of dpgfData as any[]) {
-      const designation = lot['Désignation'] || lot['Designation'] || lot['Libellé'] || lot['description'];
-      if (!designation) continue;
+    const designations = (dpgfData as any[])
+     .map(lot => lot['Désignation'] || lot['Designation'] || lot['Libellé'] || '')
+     .filter(Boolean)
+     .slice(0, 20); // On limite à 20 lignes pour tester
 
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'mixtral-8x7b-32768',
-          messages: [
-            {
-              role: 'system',
-              content: 'Tu es économiste BTP France. Réponds UNIQUEMENT par un prix formaté: 450€/m². Jamais de phrase.',
-            },
-            {
-              role: 'user',
-              content: `Prix HT pour: ${designation}. Format: 450€/m²`,
-            },
-          ],
-          temperature: 0,
-          max_tokens: 10,
-        }),
-      });
+    console.log('Call Groq...');
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant', // Plus rapide que mixtral
+        messages: [
+          {
+            role: 'system',
+            content: 'Tu es économiste BTP. Réponds en JSON: {"resultats":[{"prix":"450€/m²"}]}',
+          },
+          {
+            role: 'user',
+            content: `Prix HT pour: ${JSON.stringify(designations)}`,
+          },
+        ],
+        temperature: 0,
+        max_tokens: 1000,
+        response_format: { type: "json_object" },
+      }),
+    });
 
-      if (!res.ok) {
-        results.push({ lot: lot['Lot'] || '', designation, prixEstime: 'Erreur API' });
-        continue;
-      }
+    console.log('Groq status:', res.status);
+    const data = await res.json();
+    const prixData = JSON.parse(data.choices[0].message.content);
+    console.log('Groq OK');
 
-      const data = await res.json();
-      let prixEstime = data.choices?.[0]?.message?.content?.trim() || 'N/A';
-      if (/^\d+$/.test(prixEstime)) prixEstime = `${prixEstime}€`;
+    const results = designations.map((d, i) => ({
+      lot: '',
+      designation: d,
+      prixEstime: prixData.resultats?.[i]?.prix || 'N/A',
+    }));
 
-      results.push({
-        lot: lot['Lot'] || lot['lot'] || '',
-        designation,
-        prixEstime,
-      });
-    }
-
-    // Génère le PDF
     const pdfDoc = await PDFDocument.create();
     const page = pdfDoc.addPage([595, 842]);
-    const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
-
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
     let y = 800;
-    page.drawText('DPGF Chiffré - LightAO', { x: 50, y, size: 18, font, color: rgb(0, 0, 0) });
-    y -= 40;
-    page.drawText('Lot | Désignation | Prix HT', { x: 50, y, size: 12, font });
-    y -= 25;
 
     for (const r of results) {
-      const line = `${r.lot} | ${r.designation} | ${r.prixEstime}`;
-      page.drawText(line.slice(0, 85), { x: 50, y, size: 10, font: fontRegular });
-      y -= 15;
-      if (y < 50) break;
+      page.drawText(`${r.designation} : ${r.prixEstime}`, { x: 50, y, size: 11, font });
+      y -= 20;
     }
 
     const pdfBytes = await pdfDoc.save();
+    console.log('PDF OK');
 
     return new NextResponse(pdfBytes, {
-      headers: {
-        'Content-Type': 'application/pdf',
-        'Content-Disposition': 'attachment; filename="dpgf_chiffre.pdf"',
-      },
+      headers: { 'Content-Type': 'application/pdf' },
     });
   } catch (error) {
-    console.error('ERREUR API MATCH:', error);
-    return NextResponse.json({ error: 'Erreur serveur', details: String(error) }, { status: 500 });
+    console.error('ERREUR:', error);
+    return NextResponse.json({ error: String(error) }, { status: 500 });
   }
 }
