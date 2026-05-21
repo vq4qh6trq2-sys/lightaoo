@@ -1,8 +1,55 @@
 import { NextRequest, NextResponse } from 'next/server';
 import * as XLSX from 'xlsx';
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { PDFDocument, StandardFonts } from 'pdf-lib';
 
 export const maxDuration = 60;
+
+function findDesignationColumn(data: any[]): string {
+  if (!data.length) return '';
+
+  const keys = Object.keys(data[0]);
+  const banned = ['unite', 'unité', 'qte', 'quant', 'prix', 'montant', 'total', 'pu', 'lot', 'num', 'ref'];
+
+  let bestKey = '';
+  let bestScore = 0;
+
+  for (const key of keys) {
+    const keyLower = key.toLowerCase().trim();
+    if (banned.some(b => keyLower.includes(b))) continue;
+    if (!key.trim()) continue;
+
+    let textScore = 0;
+    let count = 0;
+
+    for (let i = 0; i < Math.min(data.length, 20); i++) {
+      const val = String(data[i][key] || '').trim();
+      if (val &&!val.includes('CHAPITRE') &&!val.includes('TOTAL') && val!== '#REF!') {
+        count++;
+        // Plus le texte est long, plus c'est sûrement une désignation
+        if (val.length > 10 && isNaN(Number(val))) textScore += val.length;
+      }
+    }
+
+    if (count > 3 && textScore > bestScore) {
+      bestScore = textScore;
+      bestKey = key;
+    }
+  }
+
+  // Fallback: 1ère colonne non-vide si rien trouvé
+  if (!bestKey) {
+    bestKey = keys.find(k => k.trim() &&!banned.some(b => k.toLowerCase().includes(b))) || keys[1] || '';
+  }
+
+  return bestKey;
+}
+
+function findUnitColumn(data: any[], keys: string[]): string {
+  return keys.find(k => {
+    const kl = k.toLowerCase();
+    return kl.includes('unit') || kl === 'u' || kl === 'u.' || kl === 'un';
+  }) || '';
+}
 
 export async function POST(req: NextRequest) {
   console.log('START');
@@ -15,37 +62,54 @@ export async function POST(req: NextRequest) {
     const workbook = XLSX.read(dpgfBuffer);
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
 
-    // On démarre à la ligne 5 : là où y'a PRESTATIONS, UNITES, etc
-    const dpgfData = XLSX.utils.sheet_to_json(sheet, { range: 5, defval: '' });
+    // On lit tout et on laisse l'algo trouver la bonne ligne d'en-tête
+    const rawData = XLSX.utils.sheet_to_json(sheet, { defval: '' });
 
-    console.log('Nb lignes lues:', dpgfData.length);
-    console.log('Exemple ligne:', dpgfData[0]);
+    // Trouve la ligne d'en-tête : celle qui contient "PRESTATION" ou "DESIGNATION" ou "LIBELLE"
+    let headerRowIndex = rawData.findIndex((row: any) => {
+      const values = Object.values(row).map(v => String(v).toLowerCase());
+      return values.some(v => v.includes('prestation') || v.includes('design') || v.includes('libell') || v.includes('ouvrage'));
+    });
+
+    if (headerRowIndex === -1) headerRowIndex = 4; // Fallback ligne 5
+
+    const dpgfData = XLSX.utils.sheet_to_json(sheet, { range: headerRowIndex, defval: '' });
+    console.log('Header ligne:', headerRowIndex + 1);
+    console.log('Colonnes:', Object.keys(dpgfData[0] || {}));
+
+    const designationKey = findDesignationColumn(dpgfData);
+    const unitKey = findUnitColumn(dpgfData, Object.keys(dpgfData[0] || {}));
+
+    console.log('Colonne désignation détectée:', designationKey);
+    console.log('Colonne unité détectée:', unitKey);
 
     const designations = (dpgfData as any[])
-    .map(row => {
-       const prestation = String(row['PRESTATIONS'] || '').trim();
-       const unit = String(row['UNITES'] || '').trim();
+   .map(row => {
+       const prestation = String(row[designationKey] || '').trim();
+       const unit = String(row[unitKey] || '').trim();
        return { prestation, unit };
      })
-    .filter(r =>
+   .filter(r =>
        r.prestation &&
-      !r.prestation.toUpperCase().includes('CHAPITRE') &&
-      !r.prestation.toUpperCase().includes('TOTAL') &&
+       r.prestation.length > 5 &&
+     !r.prestation.toUpperCase().includes('CHAPITRE') &&
+     !r.prestation.toUpperCase().includes('TOTAL') &&
        r.prestation!== '#REF!'
      )
-    .slice(0, 10); // Max 10 pour test
+   .slice(0, 15);
 
-    console.log('Designations extraites:', designations.map(d => d.prestation));
+    console.log('Nb prestations trouvées:', designations.length);
+    console.log('Exemples:', designations.slice(0, 3).map(d => d.prestation));
 
     if (designations.length === 0) {
-      return NextResponse.json({ error: 'Aucune prestation trouvée. Vérifie le DPGF.' }, { status: 400 });
+      return NextResponse.json({ error: 'Aucune prestation détectée dans le DPGF' }, { status: 400 });
     }
 
     if (!process.env.GROQ_API_KEY) {
       return NextResponse.json({ error: 'Clé API Groq manquante' }, { status: 500 });
     }
 
-    const promptList = designations.map(d => `${d.prestation} (${d.unit})`);
+    const promptList = designations.map(d => d.unit? `${d.prestation} (${d.unit})` : d.prestation);
 
     console.log('Call Groq...');
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -59,15 +123,15 @@ export async function POST(req: NextRequest) {
         messages: [
           {
             role: 'system',
-            content: 'Tu es économiste BTP France. Réponds UNIQUEMENT en JSON: {"resultats":[{"prix":"450€/Ft"}]}. Prix HT moyens France. Garde l\'unité donnée.',
+            content: 'Tu es économiste BTP France. Réponds UNIQUEMENT en JSON: {"resultats":[{"prix":"450€/Ft"}]}. Prix HT moyens France. Garde l\'unité donnée entre parenthèses.',
           },
           {
             role: 'user',
-            content: `Donne le prix HT pour: ${JSON.stringify(promptList)}`,
+            content: JSON.stringify(promptList),
           },
         ],
         temperature: 0.1,
-        max_tokens: 800,
+        max_tokens: 1000,
       }),
     });
 
@@ -79,7 +143,7 @@ export async function POST(req: NextRequest) {
 
     const data = await res.json();
     const content = data.choices[0].message.content;
-    console.log('Groq raw:', content);
+    console.log('Groq OK');
 
     let prixData;
     try {
@@ -94,25 +158,9 @@ export async function POST(req: NextRequest) {
     const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
     let y = 800;
 
-    page.drawText('DPGF Chiffre - Lot 2 EP/SL', { x: 50, y, size: 16, font: fontBold });
+    page.drawText('DPGF Chiffré - LightAO', { x: 50, y, size: 16, font: fontBold });
     y -= 30;
-    page.drawText('Prestation | Unité | Prix HT estimé', { x: 50, y, size: 12, font: fontBold });
-    y -= 20;
 
     designations.forEach((d, i) => {
-      const prix = prixData.resultats?.[i]?.prix || 'Non estimé';
-      const line = `${d.prestation.slice(0, 40)} | ${d.unit} | ${prix}`;
-      page.drawText(line, { x: 50, y, size: 10, font });
-      y -= 15;
-      if (y < 50) return; // Évite de sortir de la page
-    });
-
-    const pdfBytes = await pdfDoc.save();
-    console.log('PDF OK');
-    return new NextResponse(pdfBytes, { headers: { 'Content-Type': 'application/pdf' } });
-
-  } catch (error) {
-    console.error('ERREUR FINALE:', error);
-    return NextResponse.json({ error: String(error) }, { status: 500 });
-  }
-}
+      const prix = prixData.resultats?.[i]?.prix || 'N/A';
+      const line = `${d.prestation.slice(0, 45)} ${d.unit?
