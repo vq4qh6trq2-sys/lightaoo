@@ -13,18 +13,35 @@ export async function POST(req: NextRequest) {
 
     const dpgfBuffer = Buffer.from(await dpgfFile.arrayBuffer());
     const workbook = XLSX.read(dpgfBuffer);
-    const dpgfData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const dpgfData = XLSX.utils.sheet_to_json(sheet);
+
+    console.log('Colonnes Excel:', Object.keys(dpgfData[0] || {}));
+    console.log('Nb lignes Excel:', dpgfData.length);
+
+    // On prend la 2ème colonne par défaut si on trouve pas "Désignation"
+    const keys = Object.keys(dpgfData[0] || {});
+    const designationKey = keys.find(k =>
+      k.toLowerCase().includes('design') ||
+      k.toLowerCase().includes('libell') ||
+      k.toLowerCase().includes('descript')
+    ) || keys[1]; // fallback: 2ème colonne
+
+    console.log('Colonne utilisée:', designationKey);
 
     const designations = (dpgfData as any[])
-    .map(lot => lot['Désignation'] || lot['Designation'] || lot['Libellé'] || lot['Description'] || '')
-    .filter(Boolean)
-    .slice(0, 5);
+     .map(lot => String(lot[designationKey] || '').trim())
+     .filter(Boolean)
+     .slice(0, 5);
 
-    console.log('Nb designations:', designations.length);
+    console.log('Designations extraites:', designations);
+
+    if (designations.length === 0) {
+      return NextResponse.json({ error: 'Aucune désignation trouvée dans le DPGF' }, { status: 400 });
+    }
 
     if (!process.env.GROQ_API_KEY) {
-      console.log('ERREUR: GROQ_API_KEY manquante');
-      return NextResponse.json({ error: 'Clé API Groq manquante sur Vercel' }, { status: 500 });
+      return NextResponse.json({ error: 'Clé API Groq manquante' }, { status: 500 });
     }
 
     console.log('Call Groq...');
@@ -39,11 +56,11 @@ export async function POST(req: NextRequest) {
         messages: [
           {
             role: 'system',
-            content: 'Tu es économiste BTP France. Tu réponds UNIQUEMENT en JSON valide. Format exact: {"resultats":[{"prix":"450€/m²"}]}. Aucun texte avant ou après. Pour chaque élément de la liste donnée, donne un prix HT moyen BTP France.',
+            content: 'Tu es économiste BTP France. Réponds UNIQUEMENT en JSON: {"resultats":[{"prix":"450€/m²"}]}. Aucun texte. Prix HT moyens France pour chaque lot.',
           },
           {
             role: 'user',
-            content: `Liste: ${JSON.stringify(designations)}`,
+            content: JSON.stringify(designations),
           },
         ],
         temperature: 0.1,
@@ -65,11 +82,8 @@ export async function POST(req: NextRequest) {
     try {
       prixData = JSON.parse(content);
     } catch (e) {
-      console.log('Groq a pas renvoyé du JSON:', content);
-      return NextResponse.json({ error: 'Groq a renvoyé un format invalide. Réessaie.' }, { status: 500 });
+      return NextResponse.json({ error: 'Groq format invalide' }, { status: 500 });
     }
-
-    console.log('Groq parse OK');
 
     const pdfDoc = await PDFDocument.create();
     const page = pdfDoc.addPage([595, 842]);
@@ -77,13 +91,12 @@ export async function POST(req: NextRequest) {
     const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
     let y = 800;
 
-    page.drawText('DPGF Chiffré - LightAO', { x: 50, y, size: 18, font: fontBold });
+    page.drawText('DPGF Chiffre - LightAO', { x: 50, y, size: 18, font: fontBold });
     y -= 40;
 
     designations.forEach((d, i) => {
-      const prix = prixData.resultats?.[i]?.prix || 'Non estimé';
-      const line = `${d.slice(0, 50)} : ${prix}`;
-      page.drawText(line, { x: 50, y, size: 11, font });
+      const prix = prixData.resultats?.[i]?.prix || 'Non estime';
+      page.drawText(`${d.slice(0, 60)} : ${prix}`, { x: 50, y, size: 11, font });
       y -= 20;
     });
 
