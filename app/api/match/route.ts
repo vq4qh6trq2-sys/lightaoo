@@ -6,10 +6,8 @@ export const maxDuration = 60;
 
 function findDesignationColumn(data: any[]): string {
   if (!data.length) return '';
-
   const keys = Object.keys(data[0]);
   const banned = ['unite', 'unité', 'qte', 'quant', 'prix', 'montant', 'total', 'pu', 'lot', 'num', 'ref'];
-
   let bestKey = '';
   let bestScore = 0;
 
@@ -25,7 +23,6 @@ function findDesignationColumn(data: any[]): string {
       const val = String(data[i][key] || '').trim();
       if (val &&!val.includes('CHAPITRE') &&!val.includes('TOTAL') && val!== '#REF!') {
         count++;
-        // Plus le texte est long, plus c'est sûrement une désignation
         if (val.length > 10 && isNaN(Number(val))) textScore += val.length;
       }
     }
@@ -36,11 +33,9 @@ function findDesignationColumn(data: any[]): string {
     }
   }
 
-  // Fallback: 1ère colonne non-vide si rien trouvé
   if (!bestKey) {
     bestKey = keys.find(k => k.trim() &&!banned.some(b => k.toLowerCase().includes(b))) || keys[1] || '';
   }
-
   return bestKey;
 }
 
@@ -61,17 +56,14 @@ export async function POST(req: NextRequest) {
     const dpgfBuffer = Buffer.from(await dpgfFile.arrayBuffer());
     const workbook = XLSX.read(dpgfBuffer);
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-
-    // On lit tout et on laisse l'algo trouver la bonne ligne d'en-tête
     const rawData = XLSX.utils.sheet_to_json(sheet, { defval: '' });
 
-    // Trouve la ligne d'en-tête : celle qui contient "PRESTATION" ou "DESIGNATION" ou "LIBELLE"
     let headerRowIndex = rawData.findIndex((row: any) => {
       const values = Object.values(row).map(v => String(v).toLowerCase());
       return values.some(v => v.includes('prestation') || v.includes('design') || v.includes('libell') || v.includes('ouvrage'));
     });
 
-    if (headerRowIndex === -1) headerRowIndex = 4; // Fallback ligne 5
+    if (headerRowIndex === -1) headerRowIndex = 4;
 
     const dpgfData = XLSX.utils.sheet_to_json(sheet, { range: headerRowIndex, defval: '' });
     console.log('Header ligne:', headerRowIndex + 1);
@@ -99,7 +91,6 @@ export async function POST(req: NextRequest) {
    .slice(0, 15);
 
     console.log('Nb prestations trouvées:', designations.length);
-    console.log('Exemples:', designations.slice(0, 3).map(d => d.prestation));
 
     if (designations.length === 0) {
       return NextResponse.json({ error: 'Aucune prestation détectée dans le DPGF' }, { status: 400 });
@@ -163,4 +154,19 @@ export async function POST(req: NextRequest) {
 
     designations.forEach((d, i) => {
       const prix = prixData.resultats?.[i]?.prix || 'N/A';
-      const line = `${d.prestation.slice(0, 45)} ${d.unit ? `(${d.unit})` : ''} : ${prix}`;
+      const unitText = d.unit? `(${d.unit})` : '';
+      const line = `${d.prestation.slice(0, 45)} ${unitText} : ${prix}`;
+      page.drawText(line, { x: 50, y, size: 9, font });
+      y -= 14;
+      if (y < 50) return;
+    });
+
+    const pdfBytes = await pdfDoc.save();
+    console.log('PDF OK');
+    return new NextResponse(pdfBytes, { headers: { 'Content-Type': 'application/pdf' } });
+
+  } catch (error) {
+    console.error('ERREUR FINALE:', error);
+    return NextResponse.json({ error: String(error) }, { status: 500 });
+  }
+}
