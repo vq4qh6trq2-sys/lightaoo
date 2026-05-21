@@ -163,4 +163,4 @@ export async function POST(req: NextRequest) {
 
     designations.forEach((d, i) => {
       const prix = prixData.resultats?.[i]?.prix || 'N/A';
-      const line = `${d.prestation.slice(0, 45)} ${d.unit?
+      const line = `${d.prestation.slice(0, 45)} ${d.unit ? `(${d.unit})` : ''} : ${prix}`;?
